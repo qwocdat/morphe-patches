@@ -38,16 +38,26 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p patches/src/main/resources/modules
-          TAG_FLAG=""
-          if [ "${{ github.ref_name }}" = "dev" ]; then
-            TAG_FLAG="nightly"
+          LATEST_TAG="$(gh release list --repo qwocdat/ZaloXposed --limit 1 --json tagName --jq '.[0].tagName // empty' || true)"
+          if [ -n "$LATEST_TAG" ]; then
+            echo "Downloading APK from qwocdat/ZaloXposed ($LATEST_TAG)..."
+            gh release download "$LATEST_TAG" \
+              --repo qwocdat/ZaloXposed \
+              --pattern "*.apk" \
+              --output patches/src/main/resources/modules/app-release.apk \
+              --clobber
+          else
+            echo "Fallback downloading from direct release URL..."
+            curl -L -o patches/src/main/resources/modules/app-release.apk \
+              "https://github.com/qwocdat/ZaloXposed/releases/download/v-dx-784fe2c-20261122-1422/ZaloXposed-app-release.apk"
           fi
-          gh release download $TAG_FLAG --repo ElectroHeavenVN/ZaloXposed --pattern "*.apk" --output patches/src/main/resources/modules/app-release.apk --clobber
+          ls -lh patches/src/main/resources/modules/app-release.apk
 
-      # Semantic release runs its own Gradle build command.
-      # Only dev and main branch will generate a release as specified by .releaserc
+      # Semantic release runs its own Gradle build command when MORPHE_SIGNING_KEY is configured.
       - name: Release
+        if: ${{ env.MORPHE_SIGNING_KEY != '' }}
         uses: cycjimmy/semantic-release-action@v8
         id: release
         env:
@@ -61,10 +71,33 @@ jobs:
           subject-name: 'Morphe Patches ${{ steps.release.outputs.new_release_git_tag }}'
           subject-path: patches/build/libs/patches-*.mpp
 
-      # Always verify compilation when semantic-release did not publish a release.
-      # This covers non-main/dev branches, chore commits, docs commits, etc.
-      - name: Verify project compiles
+      # Build and publish .mpp directly to GitHub Releases when semantic-release did not publish.
+      - name: Build .mpp bundle
         if: steps.release.outputs.new_release_published != 'true'
+        id: build_mpp
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./gradlew :patches:buildAndroid clean --no-daemon
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew :patches:buildAndroid --no-daemon
+          mkdir -p release_mpp
+          MPP_FILE="$(find patches/build/libs -maxdepth 1 -type f -name '*.mpp' | sort | head -n1)"
+          if [ -z "$MPP_FILE" ]; then
+            echo ".mpp file not found!" >&2
+            exit 1
+          fi
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          cp "$MPP_FILE" "release_mpp/patches-digitalxiao-${SHORT_SHA}.mpp"
+          echo "tag=mpp-${SHORT_SHA}-$(date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+          ls -lh release_mpp/
+
+      - name: Publish .mpp to GitHub Releases
+        if: steps.release.outputs.new_release_published != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build_mpp.outputs.tag }}
+          name: "Morphe Patches DigitalXiao (${{ steps.build_mpp.outputs.tag }})"
+          files: release_mpp/*.mpp
+          draft: false
+          prerelease: false
